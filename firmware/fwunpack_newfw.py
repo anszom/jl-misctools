@@ -383,6 +383,239 @@ def load_fwsc(f):
 def load_raw(f):
     return f.read()  # that's it
 
+#---------------------------------------------------------------------------------------------
+#
+# Pack-manifest emitter.
+#
+# The regular unpacker above dumps files for humans, but it drops the structural
+# glue needed to rebuild an image: the reserved partition definitions (VM / PRCT /
+# BTIF / key_mac), the flash-header fields, the raw (bankcb-scrambled) SPL, the
+# entry ordering / offsets, and the "dead" non-0xFF bytes that live outside the
+# filesystem. This pass re-walks the image and writes `fwpack.yaml` plus the extra
+# artifacts (top/uboot.boot.raw, files/*.blob, raw/*.bin) so that fwpack_newfw.py
+# can reconstruct the image faithfully - and so that any patching (resize app.bin,
+# move/shrink VM, blank the dead slack) can be done by editing the manifest / files.
+#
+
+def _locate_baseoff(fw):
+    for off in [0, 0x1000, 0x10000, 0x80000, 0x100000, 0x180000]:
+        header = bytearray(fw[off:off+32])
+        jl_enc_cipher(header, 0, len(header), 0xFFFF)
+        hcrc = int.from_bytes(header[:2], 'little')
+        if hcrc != 0 and jl_crc16(header[2:]) == hcrc:
+            return off
+    raise RuntimeError('Could not locate the base offset of the firmware.')
+
+def write_pack_manifest(path:Path, outdir:Path):
+    # Unwrap the container (.ufw/.fwsc) down to the raw flash image, same as the
+    # main unpacker. The manifest / packer work in the raw-flash domain; re-wrapping
+    # a packed image back into a container is out of scope.
+    with open(path, 'rb') as f:
+        enc = None
+        for loader in [load_ufw, load_fwsc, load_raw]:
+            f.seek(0)
+            data = loader(f)
+            if data is not None:
+                enc = bytearray(data)
+                break
+    if enc is None:
+        raise RuntimeError('Could not load the firmware data.')
+    dec = bytearray(enc)
+    headerkey = 0xFFFF
+
+    baseoff = _locate_baseoff(dec)
+
+    # flash header fields (vid/pid are stored RAW on flash; CRC is over the fully
+    # descrambled header, and resvd is meaningful - so keep all of it verbatim)
+    hdr = bytearray(dec[baseoff:baseoff+32])
+    jl_enc_cipher(hdr, 0, 32, headerkey)
+    _c, fburnersz, _vid, fflashsz, ffsver, fblockalign, fresvd, fspecopt, _pid = \
+        struct.unpack('<HH4sIBBBB16s', hdr)
+    vid_raw = bytes(enc[baseoff+4:baseoff+8])
+    pid_raw = bytes(enc[baseoff+16:baseoff+32])
+
+    covered = []                        # list of [start, end) reproduced by the packer
+    covered.append((baseoff, baseoff + 32))
+
+    (outdir/'raw').mkdir(exist_ok=True)
+    (outdir/'files').mkdir(exist_ok=True)
+    (outdir/'top').mkdir(exist_ok=True)
+
+    def rel(p): return str(p.relative_to(outdir))
+
+    def entry_dict(ent, kind, file=None, inner=None):
+        d = dict(name=ent.name, name_raw=ent.raw_name.hex(),
+                 flags=int(ent.flags), resvd=int(ent.resvd),
+                 index=int(ent.index), offset=int(ent.offset), size=int(ent.size),
+                 data_crc=int(ent.data_crc), kind=kind)
+        if file is not None:  d['file'] = file
+        if inner is not None: d['inner'] = inner
+        return d
+
+    chipkey = None
+    appbase = None
+    top_list = []
+    reserved_parts = []   # (entry_dict, data_offset, data_size) for later data dumping
+
+    for i, ent in enumerate(JLFSIterator(dec, baseoff, 32, key=headerkey)):
+        covered.append((ent.hdr_off, ent.hdr_off + 32))
+
+        if i == 0:
+            # SPL: keep the ORIGINAL bankcb-scrambled bytes so we can repack verbatim
+            raw = bytes(enc[ent.data_offset:ent.data_offset + ent.data_size])
+            (outdir/'top'/'uboot.boot.raw').write_bytes(raw)
+            covered.append((ent.data_offset, ent.data_offset + ent.data_size))
+            top_list.append(entry_dict(ent, 'spl', file='top/uboot.boot.raw'))
+
+        elif ent.flags == 0x81 and ent.name == 'app_dir_head':
+            if appbase is None:
+                appbase = ent.data_offset
+            top_list.append(entry_dict(ent, 'app-area'))
+
+        elif ent.flags & 0x10:
+            # reserved partition declaration (e.g. key_mac). Whether its region is
+            # a data partition (dumped + covered) or a bare declaration is decided
+            # later, once the firmware end is known.
+            d = entry_dict(ent, 'reserved')
+            reserved_parts.append((d, ent.data_offset, ent.data_size))
+            top_list.append(d)
+
+        else:
+            # plaintext data blob on flash (e.g. isd_config.ini, incl. the chipkey)
+            raw = bytes(enc[ent.data_offset:ent.data_offset + ent.data_size])
+            fp = outdir/'top'/ent.name
+            fp.write_bytes(raw)
+            covered.append((ent.data_offset, ent.data_offset + ent.data_size))
+            top_list.append(entry_dict(ent, 'plain', file=rel(fp)))
+            if ent.name == 'isd_config.ini':
+                ckdata, ckcrc = struct.unpack_from('<32sH', raw, 0)
+                if jl_crc16(ckdata) == ckcrc:
+                    chipkey = chipkeybin_decode(ckdata)
+
+    if appbase is None:
+        raise RuntimeError('An app_dir_head has not been found.')
+    if chipkey is None:
+        raise RuntimeError('Unknown chipkey.')
+
+    app_list = []
+    it = JLFSIterator(dec, appbase, 0, key=chipkey, sfc=True)
+    for i, ent in enumerate(it):
+        if i == 0:
+            # app_area_head: a directory reconstructed from its inner entries so
+            # app.bin / VM / PRCT can be edited individually.
+            inner = []
+            for aent in JLFSIterator(dec, ent.hdr_off, ent.data_offset - ent.hdr_off):
+                if aent.flags & 0x10:
+                    # VM / PRCT / BTIF: managed partitions (NVM, protect map, BT info).
+                    d = entry_dict(aent, 'reserved')
+                    reserved_parts.append((d, aent.data_offset, aent.data_size))
+                    inner.append(d)
+                else:
+                    fp = outdir/'files'/aent.name
+                    fp.write_bytes(bytes(dec[aent.data_offset:aent.data_offset + aent.data_size]))
+                    inner.append(entry_dict(aent, 'file', file=rel(fp)))
+            app_list.append(entry_dict(ent, 'dir', inner=inner))
+        elif ent.flags == 0x82:
+            fp = outdir/'files'/ent.name
+            fp.write_bytes(bytes(dec[ent.data_offset:ent.data_offset + ent.data_size]))
+            app_list.append(entry_dict(ent, 'file', file=rel(fp)))
+        else:
+            # a directory-ish resource (e.g. tone): keep its decrypted payload as an
+            # opaque blob - its internals are position-relative and need no editing.
+            fp = outdir/'files'/(ent.name + '.blob')
+            fp.write_bytes(bytes(dec[ent.data_offset:ent.data_offset + ent.data_size]))
+            app_list.append(entry_dict(ent, 'dir-blob', file=rel(fp)))
+
+    sfc_end = it.dec_off
+    covered.append((appbase, sfc_end))   # the whole SFC stream is reproduced
+
+    # --- dump the contents of data partitions (VM / key_mac): reserved regions that
+    #     sit ABOVE the firmware and inside the image. These hold runtime NVM / key
+    #     storage - the user decides what to do with them (keep / blank / resize).
+    #     Reserved regions that overlay the firmware (PRCT) or lie beyond the image
+    #     (BTIF) are pure declarations and get no data file. ---
+    (outdir/'partitions').mkdir(exist_ok=True)
+    for d, doff, dsize in reserved_parts:
+        end = min(doff + dsize, len(enc))
+        if doff >= sfc_end and end > doff:
+            fp = outdir/'partitions'/(d['name'] + '.bin')
+            fp.write_bytes(bytes(enc[doff:end]))
+            d['data'] = rel(fp)
+            covered.append((doff, end))   # its bytes live in the partition file now
+            blank = all(b == 0xFF for b in enc[doff:end])
+            print(f'  partition {d["name"]:<8} @ {doff:#08x} '
+                  f'({end - doff} bytes{", blank" if blank else ""}) -> {rel(fp)}')
+
+    # --- any leftover non-0xFF bytes outside every entry and partition (defensive:
+    #     nothing on a normal image) get preserved verbatim as raw regions ---
+    covered = [(s, e) for s, e in covered if e > s]
+    covered.sort()
+    merged = []
+    for s, e in covered:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+
+    raw_regions = []
+    pos = 0
+    holes = []
+    for s, e in merged:
+        if pos < s: holes.append((pos, s))
+        pos = max(pos, e)
+    if pos < len(enc): holes.append((pos, len(enc)))
+
+    # Within each uncovered hole, emit a raw region per maximal non-0xFF run,
+    # coalescing across short 0xFF gaps so scattered stray bytes in an otherwise
+    # blank area don't glue the whole thing into one giant blob. The packer's
+    # canvas is already 0xFF, so pure-0xFF stretches need no region at all.
+    GAP = 64
+    for hs, he in holes:
+        run_start = None
+        last_nonff = None
+        i = hs
+        while i <= he:
+            b = enc[i] if i < he else 0xFF
+            if i < he and b != 0xFF:
+                if run_start is None:
+                    run_start = i
+                last_nonff = i
+            elif run_start is not None and (i - last_nonff > GAP or i == he):
+                off = run_start
+                fp = outdir/'raw'/f'{off:08X}.bin'
+                fp.write_bytes(bytes(enc[run_start:last_nonff + 1]))
+                raw_regions.append(dict(offset=int(off), file=rel(fp)))
+                run_start = None
+            i += 1
+
+    manifest = dict(
+        format='jl-new-fw-pack', version=1,
+        base_offset=int(baseoff),
+        image_size=int(len(enc)),
+        chip_key=int(chipkey),
+        flash_header=dict(
+            burner_size=int(fburnersz),
+            flash_size=int(fflashsz),
+            fs_version=int(ffsver),
+            block_alignment=int(fblockalign),
+            reserved=int(fresvd),
+            special_option=int(fspecopt),
+            vid_hex=vid_raw.hex(),
+            pid_hex=pid_raw.hex(),
+        ),
+        top=top_list,
+        app=app_list,
+        raw_regions=raw_regions,
+    )
+
+    with open(outdir/'fwpack.yaml', 'w') as f:
+        yaml.dump(manifest, f, sort_keys=False)
+
+    print(f'Pack manifest written: {outdir/"fwpack.yaml"}  '
+          f'({len(raw_regions)} raw region(s), sfc_end @ {sfc_end:#x})')
+
+#---------------------------------------------------------------------------------------------
+
 def parsefw(path:Path, outdir:Path):
     # Load firmware data
     with open(path, 'rb') as f:
@@ -416,6 +649,12 @@ def parsefw(path:Path, outdir:Path):
         # Dump the info file
         with open(outdir/'jlfw.yaml', 'w') as f:
             yaml.dump(info, f)
+
+    # Emit the pack manifest + extra artifacts needed to rebuild the image.
+    try:
+        write_pack_manifest(path, outdir)
+    except Exception as e:
+        print('[!] pack manifest:', e)
 
 #---------------------------------------------------------------------------------------------
 
